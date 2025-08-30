@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ASA Burn Village (v1)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Pera Wallet Connect (UMD build) -->
+  <script src="https://unpkg.com/@perawallet/connect/dist/perawallet-connect.min.js"></script>
+  <!-- Algorand JS SDK -->
+  <script src="https://unpkg.com/algosdk/dist/browser/algosdk.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background:#0b1220; color:#eaeefb; }
+    header { display: flex; gap: 12px; align-items: center; padding: 12px 16px; background:#0d1529; position:sticky; top:0; z-index:10; }
+    button { background:#1f2a44; color:#eaeefb; border:1px solid #2c3c67; padding:8px 12px; border-radius:10px; cursor:pointer; }
+    button:hover { background:#29365b; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .panel { padding:12px; border:1px solid #2c3c67; border-radius:12px; background:#0d1529; margin:12px; }
+    #gamewrap { display:grid; grid-template-columns: 380px 1fr; gap:12px; }
+    #log { height:120px; overflow:auto; font-size:12px; background:#0b1220; border:1px solid #23305a; padding:8px; border-radius:8px; }
+    .stat { font-variant-numeric: tabular-nums; }
+    canvas { display:block; background:#0a0f1d; border:1px solid #23305a; border-radius:12px; margin:12px; }
+    .small { opacity:0.75; font-size:12px; }
+    a { color:#9ecbff; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <header>
+    <button id="connectBtn">Connect Pera</button>
+    <div id="acct" class="small">Not connected</div>
+    <div style="margin-left:auto" class="small">ASA Burn Village v1</div>
+  </header>
+
+  <div id="gamewrap">
+    <div class="panel">
+      <h3>Controls</h3>
+      <div class="row">
+        <button id="optInBtn">Opt-In ASA</button>
+        <button id="buyFirstHouseBtn">Buy First House (2 ALGO)</button>
+        <button id="buyHouseBtn">Buy House (burn ASA)</button>
+        <button id="buyBoostBtn">Buy Boost (burn ASA)</button>
+        <button id="hireWorkerBtn">Hire Worker (burn ASA)</button>
+      </div>
+
+      <h3>Stats</h3>
+      <div class="stat">Houses: <span id="houses">0</span></div>
+      <div class="stat">Boosts: <span id="boosts">0</span></div>
+      <div class="stat">Workers: <span id="workers">0</span></div>
+      <div class="stat">Rate: <span id="rate">0</span> ASA/min</div>
+      <div class="stat">Unclaimed (simulated): <span id="bank">0</span> ASA</div>
+      <div class="small">House Cost: <span id="houseCost">0</span> ASA (after first)</div>
+      <div class="small">Boost Cost: <span id="boostCost">0</span> ASA</div>
+      <div class="small">Worker Cost: <span id="workerCost">0</span> ASA</div>
+      <div class="small">First House goes to treasury in ALGO. All later purchases are <strong>burns</strong> (ASA → burn address).</div>
+
+      <h3>Chain Config</h3>
+      <div class="small">
+        <div>ASA_ID: <span id="cfgAsaId"></span></div>
+        <div>Treasury: <span id="cfgTreasury"></span></div>
+        <div>Burn: <span id="cfgBurn"></span></div>
+        <div>Network: TestNet (default)</div>
+      </div>
+
+      <h3>Log</h3>
+      <div id="log"></div>
+    </div>
+
+    <div>
+      <canvas id="c" width="720" height="420"></canvas>
+      <div class="panel small">
+        Tip: Click the foreman to make them “hustle” briefly (temporary rate bump).
+      </div>
+    </div>
+  </div>
+
+<script>
+/** =========================
+ *  1) CONFIG — YOUR ASA DETAILS
+ *  ========================= */
+// Replace these constants with your actual ASA ID and treasury address
+const ASA_ID = 3189468904; // your ASA id
+const TREASURY_ADDR = "UIAD5462SRAVNNJUPPZD7AKROSLNPGSHP2YRI2GUWOEOOOAHPTDPPJRBAE"; // your treasury address
+const ALGO_AMOUNT_FOR_FIRST_HOUSE = 2_000_000; // microAlgos (2 ALGO)
+const BURN_ADDR = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ"; // Algorand zero/black-hole
+
+/** =========================
+ *  2) SIMPLE ECONOMY
+ *  ========================= */
+const baseHouseCost = 1000;      // starting ASA cost after first house
+const houseGrowth   = 1.35;      // exponential growth
+const baseBoostCost = 750;       // ASA
+const boostGrowth   = 1.5;
+const baseRate      = 0.25;      // ASA per minute per House
+const boostMult     = 1.25;      // each boost multiplies rate
+const workerBaseOutputPerMin = 0.10;     // ASA per minute per worker
+const workerCostBase = 500;              // ASA to hire first worker
+const workerCostGrowth = 1.45;           // exponential cost growth for each worker
+const capacityPerHouse = 3;              // each house adds worker capacity
+const houseEffBonus = 0.03;              // +3% efficiency per house
+const hustleMult = 1.5;                  // hustling multiplier
+
+function houseCost(nHouses) {
+  return Math.floor(baseHouseCost * Math.pow(houseGrowth, Math.max(0, nHouses-1)));
+}
+function boostCost(nBoosts) {
+  return Math.floor(baseBoostCost * Math.pow(boostGrowth, nBoosts));
+}
+function workerCost(nWorkers) {
+  return Math.floor(workerCostBase * Math.pow(workerCostGrowth, nWorkers));
+}
+function capacity(houses) {
+  return houses * capacityPerHouse;
+}
+function efficiencyFromHouses(houses) {
+  return 1 + (houses * houseEffBonus);
+}
+
+/** =========================
+ *  3) STATE
+ *  ========================= */
+let houses = 0;
+let boosts = 0;
+let workers = [];
+let hiredCount = 0;
+let unclaimed = 0; // simulated in-UI bank (v0)
+let lastTick = Date.now();
+let hustleUntil = 0;
+
+/** =========================
+ *  4) UTILITY FUNCTIONS
+ *  ========================= */
+function log(s) {
+  const el = document.getElementById("log");
+  el.innerText = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.innerText;
+}
+function renderStats() {
+  document.getElementById("houses").innerText = houses;
+  document.getElementById("boosts").innerText = boosts;
+  document.getElementById("workers").innerText = workers.length;
+  document.getElementById("rate").innerText = currentTotalRate().toFixed(3);
+  document.getElementById("bank").innerText = Math.floor(unclaimed);
+  document.getElementById("houseCost").innerText = houseCost(houses).toLocaleString();
+  document.getElementById("boostCost").innerText = boostCost(boosts).toLocaleString();
+  document.getElementById("workerCost").innerText = workerCost(hiredCount).toLocaleString();
+}
+function currentTotalRate() {
+  const now = Date.now();
+  const hustleBonus = now < hustleUntil ? hustleMult : 1.0;
+  const boostBonus = Math.pow(boostMult, boosts);
+  const houseEff = efficiencyFromHouses(houses);
+  const perWorker = workerBaseOutputPerMin * boostBonus * houseEff * hustleBonus;
+  return workers.length * perWorker; // ASA per min
+}
+
+/** =========================
+ *  5) Pera Wallet + Algorand SDK
+ *  ========================= */
+const pera = new window.PeraWalletConnect.PeraWalletConnect();
+let account = null;
+let algod = null;
+const NET = "testnet"; // change to "mainnet" later
+
+function setupAlgodClient() {
+  const base = NET === "mainnet"
+    ? "https://mainnet-api.4160.nodely.dev"
+    : "https://testnet-api.4160.nodely.dev";
+  algod = new algosdk.Algodv2("", base, "");
+}
+
+async function connectPera() {
+  try {
+    const accounts = await pera.connect();
+    account = accounts && accounts.length ? accounts[0] : null;
+    document.getElementById("acct").innerText = account || "Not connected";
+    log("Connected: " + account);
+    pera.connector?.on("disconnect", () => {
+      account = null;
+      document.getElementById("acct").innerText = "Not connected";
+      log("Disconnected.");
+    });
+  } catch (e) {
+    log("Connect canceled or failed.");
+  }
+}
+
+async function suggestedParams() {
+  return await algod.getTransactionParams().do();
+}
+
+async function signAndSend(txns) {
+  algosdk.assignGroupID(txns);
+  const txnsToSign = txns.map(tx => ({
+    txn: Buffer.from(algosdk.encodeUnsignedTransaction(tx)).toString("base64")
+  }));
+  const signed = await pera.signTransaction([txnsToSign]);
+  const signedBlobs = signed.flat().map(s => new Uint8Array(Buffer.from(s, "base64")));
+  const { txId } = await algod.sendRawTransaction(signedBlobs).do();
+  log("Submitted txId: " + txId);
+  await algosdk.waitForConfirmation(algod, txId, 4);
+  log("Confirmed: " + txId);
+  return txId;
+}
+
+/** =========================
+ *  6) ON-CHAIN ACTIONS
+ *  ========================= */
+async function optInASA() {
+  if (!account) return alert("Connect Pera first");
+  const sp = await suggestedParams();
+  const txn = algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
+    from: account,
+    to: account,
+    amount: 0,
+    assetIndex: ASA_ID,
+    suggestedParams: sp,
+  });
+  await signAndSend([txn]);
+  log("Opt-in complete.");
+}
+
+async function buyFirstHouseALGO() {
+  if (!account) return alert("Connect Pera first");
+  if (houses > 0) return alert("You already own a house. Use 'Buy House (burn ASA)' next.");
+  const sp = await suggestedParams();
+  const pay = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
+    from: account,
+    to: TREASURY_ADDR,
+    amount: ALGO_AMOUNT_FOR_FIRST_HOUSE,
+    suggestedParams: sp,
+  });
+  await signAndSend([pay]);
+  houses += 1;
+  addHutSprite();
+  log("First house purchased with ALGO.");
+  renderStats();
+}
+
+async function buyHouseBurn() {
+  if (!account) return alert("Connect Pera first");
+  if (houses === 0) return alert("Buy your first house with ALGO first.");
+  const cost = houseCost(houses);
+  const sp = await suggestedParams();
+  const burnTxn = algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
+    from: account,
+    to: BURN_ADDR,
+    amount: cost,
+    assetIndex: ASA_ID,
+    suggestedParams: sp,
+  });
+  await signAndSend([burnTxn]);
+  houses += 1;
+  addHutSprite();
+  log(`House purchased. Burned ${cost} ASA.`);
+  renderStats();
+}
+
+async function buyBoostBurn() {
+  if (!account) return alert("Connect Pera first");
+  const cost = boostCost(boosts);
+  const sp = await suggestedParams();
+  const burnTxn = algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
+    from: account,
+    to: BURN_ADDR,
+    amount: cost,
+    assetIndex: ASA_ID,
+    suggestedParams: sp,
+  });
+  await signAndSend([burnTxn]);
+  boosts += 1;
+  log(`Boost purchased. Burned ${cost} ASA.`);
+  renderStats();
+}
+
+async function hireWorkerBurn() {
+  if (!account) return alert("Connect Pera first");
+  const cap = capacity(houses);
+  if (workers.length >= cap) return alert(`Need more housing. Capacity ${cap}.`);
+  const cost = workerCost(hiredCount);
+  const sp = await suggestedParams();
+  const burnTxn = algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
+    from: account,
+    to: BURN_ADDR,
+    amount: cost,
+    assetIndex: ASA_ID,
+    suggestedParams: sp,
+  });
+  await signAndSend([burnTxn]);
+  hiredCount += 1;
+  spawnWorker();
+  log(`Hired worker. Burned ${cost} ASA.`);
+  renderStats();
+}
+
+/** =========================
+ *  7) GAME LOOP & GRAPHICS
+ *  ========================= */
+const c = document.getElementById("c");
+const ctx = c.getContext("2d");
+
+const world = {
+  worker: { x: 80, y: 260, r: 16 },
+  huts: [],
+  site: { x: 600, y: 240, r: 18 }
+};
+
+function addHutSprite() {
+  const margin = 20, size = 28, cols = 10;
+  const i = houses - 1;
+  const col = i % cols, row = Math.floor(i / cols);
+  const x = 60 + col * (size + 8);
+  const y = 80 + row * (size + 8);
+  world.huts.push({ x, y, size });
+}
+
+// Worker movement and state machine
+function spawnWorker() {
+  const start = world.huts[0] ? { x: world.huts[0].x + 14, y: world.huts[0].y + 14 } : { x: 120, y: 240 };
+  workers.push({
+    x: start.x,
+    y: start.y,
+    r: 6,
+    state: "toSite",
+    t: 0,
+    speed: 40 + Math.random() * 20,
+    workTime: 3 + Math.random() * 2,
+    restTime: 2 + Math.random() * 2,
+    target: { x: world.site.x, y: world.site.y }
+  });
+}
+
+function randomHutCenter() {
+  if (!world.huts.length) return { x: 120, y: 240 };
+  const h = world.huts[Math.floor(Math.random() * world.huts.length)];
+  return { x: h.x + h.size / 2, y: h.y + h.size / 2 };
+}
+
+function moveToward(p, target, dt) {
+  const dx = target.x - p.x, dy = target.y - p.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 1) { p.x = target.x; p.y = target.y; return true; }
+  const ux = dx / dist, uy = dy / dist;
+  p.x += ux * p.speed * dt;
+  p.y += uy * p.speed * dt;
+  return false;
+}
+
+function updateWorkers(dt) {
+  for (const w of workers) {
+    if (w.state === "toSite") {
+      if (moveToward(w, world.site, dt)) {
+        w.state = "working";
+        w.t = w.workTime;
+      }
+    } else if (w.state === "working") {
+      w.t -= dt;
+      const perMin = workerBaseOutputPerMin * Math.pow(boostMult, boosts) * efficiencyFromHouses(houses) * (Date.now() < hustleUntil ? hustleMult : 1.0);
+      unclaimed += (perMin / 60) * dt;
+      if (w.t <= 0) {
+        w.state = "toHut";
+        w.target = randomHutCenter();
+      }
+    } else if (w.state === "toHut") {
+      if (moveToward(w, w.target, dt)) {
+        w.state = "resting";
+        w.t = w.restTime;
+      }
+    } else if (w.state === "resting") {
+      w.t -= dt;
+      if (w.t <= 0) {
+        w.state = "toSite";
+        w.target = { x: world.site.x, y: world.site.y };
+      }
+    }
+  }
+}
+
+function drawWorkers() {
+  for (const w of workers) {
+    ctx.beginPath();
+    ctx.arc(w.x, w.y, w.r, 0, Math.PI * 2);
+    ctx.fillStyle = (w.state === "working") ? "#9ed47a" : "#7aa2ff";
+    ctx.fill();
+  }
+  ctx.beginPath();
+  ctx.arc(world.site.x, world.site.y, world.site.r, 0, Math.PI * 2);
+  ctx.fillStyle = "#375f9a";
+  ctx.fill();
+  ctx.fillStyle = "#b9c8ff";
+  ctx.font = "12px system-ui";
+  ctx.fillText("Work Site", world.site.x - 28, world.site.y - 24);
+}
+
+function draw() {
+  ctx.clearRect(0,0,c.width,c.height);
+  ctx.fillStyle = "#11203a";
+  ctx.fillRect(0, 300, c.width, 120);
+  for (const h of world.huts) {
+    ctx.fillStyle = "#274d87";
+    ctx.fillRect(h.x, h.y, h.size, h.size);
+    ctx.fillStyle = "#1b2e57";
+    ctx.fillRect(h.x+6, h.y+h.size-8, h.size-12, 6);
+  }
+  const foreman = world.worker;
+  ctx.beginPath();
+  ctx.arc(foreman.x, foreman.y, foreman.r, 0, Math.PI * 2);
+  ctx.fillStyle = Date.now() < hustleUntil ? "#7aa2ff" : "#4b6db7";
+  ctx.fill();
+  ctx.fillStyle = "#b9c8ff";
+  ctx.font = "14px system-ui";
+  ctx.fillText("Foreman", foreman.x - 28, foreman.y - 24);
+  drawWorkers();
+}
+
+// Click foreman to hustle
+c.addEventListener("click", (ev) => {
+  const rect = c.getBoundingClientRect();
+  const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+  const w0 = world.worker;
+  const d2 = (x - w0.x)**2 + (y - w0.y)**2;
+  if (d2 <= (w0.r+4)**2) {
+    hustleUntil = Date.now() + 8000;
+    log("Foreman hustling! Temporary rate boost.");
+  }
+});
+
+let lastFrame = performance.now();
+function tick() {
+  const now = performance.now();
+  const dtSec = (now - lastFrame) / 1000;
+  lastFrame = now;
+  updateWorkers(dtSec);
+  draw();
+  renderStats();
+  requestAnimationFrame(tick);
+}
+
+/** =========================
+ *  8) UI WIRING
+ *  ========================= */
+document.getElementById("connectBtn").onclick = connectPera;
+document.getElementById("optInBtn").onclick = optInASA;
+document.getElementById("buyFirstHouseBtn").onclick = buyFirstHouseALGO;
+document.getElementById("buyHouseBtn").onclick = buyHouseBurn;
+document.getElementById("buyBoostBtn").onclick = buyBoostBurn;
+document.getElementById("hireWorkerBtn").onclick = hireWorkerBurn;
+
+document.getElementById("cfgAsaId").innerText = ASA_ID;
+document.getElementById("cfgTreasury").innerText = TREASURY_ADDR;
+document.getElementById("cfgBurn").innerText = BURN_ADDR;
+
+setupAlgodClient();
+renderStats();
+draw();
+tick();
+
+</script>
+</body>
+</html>
